@@ -331,7 +331,12 @@ class FType_Generic_OLE(FType_Base):
                 ftg.olefile = olefile.OleFileIO(ftg.data)
                 # Extract the CLSID of the root storage
                 ftg.root_clsid = ftg.olefile.root.clsid
-                ftg.root_clsid_name = clsid.KNOWN_CLSIDS.get(ftg.root_clsid, None)
+                # lookup_clsid normalizes case before consulting the curated
+                # database, so lowercase/mixed-case root CLSIDs resolve the
+                # same way as canonical uppercase ones:
+                ftg.root_clsid_name = clsid.lookup_clsid(
+                    ftg.root_clsid,
+                    source=clsid.CLSID_SOURCE_OLE_STORAGE).description
             except:
                 # TODO: log the error
                 return False

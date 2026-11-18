@@ -72,6 +72,7 @@ from oletools.ppt_record_parser import (is_ppt, PptFile,
                                         PptRecordExOleVbaActiveXAtom)
 from oletools.ooxml import XmlParser
 from oletools.common.io_encoding import ensure_stdout_handles_unicode
+from oletools.common import clsid as clsid_mod
 
 # -----------------------------------------------------------------------------
 # CHANGELOG:
@@ -89,6 +90,10 @@ from oletools.common.io_encoding import ensure_stdout_handles_unicode
 # 2018-10-30       SA: - added detection of external links (PR #317)
 # 2020-03-03 v0.56 PL: - fixed bug #541, "Ole10Native" is case-insensitive
 # 2022-01-28 v0.60 PL: - added detection of customUI tags
+# 2026-02-09       : - added assess_ole_storage() and an explainable embedded
+#                      OLE object risk grade printed by process_file, based on
+#                      the root CLSID and suspicious command/script indicators
+#                      (output and the return value are unchanged)
 
 __version__ = '0.60.1'
 
@@ -833,6 +838,28 @@ def find_customUI(xml_parser):
             yield customui_onload
 
 
+def assess_ole_storage(ole, object_type=clsid_mod.OBJECT_TYPE_EMBEDDED,
+                       class_name=None, indicators_data=None):
+    """
+    Grade an embedded OLE storage opened by olefile.
+
+    Thin wrapper over common.clsid.assess_embedded_object(): the CLSID is
+    read from the OLE root storage and its provenance is recorded as such.
+
+    :param ole: an open olefile.OleFileIO instance
+    :param object_type: one of clsid.OBJECT_TYPE_* constants
+    :param class_name: optional OLE1 class name (str/bytes)
+    :param indicators_data: optional bytes/str scanned for suspicious commands
+    :return: EmbeddedObjectRiskAssessment
+    """
+    return clsid_mod.assess_embedded_object(
+        clsid=ole.root.clsid,
+        class_name=class_name,
+        object_type=object_type,
+        indicators_data=indicators_data,
+        clsid_source=clsid_mod.CLSID_SOURCE_OLE_STORAGE)
+
+
 def process_file(filename, data, output_dir=None):
     """ find embedded objects in given file
 
@@ -886,6 +913,21 @@ def process_file(filename, data, output_dir=None):
     for ole in find_ole(filename, data, xml_parser):
         if ole is None:    # no ole file found
             continue
+
+        # Structured risk grade of the embedded OLE storage, based on its root
+        # CLSID (and exact indicators inside the OLE10 native streams below).
+        # Output is additive; the (err_stream, err_dumping, did_dump) return
+        # value and all existing lines are unchanged.
+        try:
+            risk = assess_ole_storage(ole)
+        except Exception:
+            log.warning('risk assessment failed for %s', filename,
+                        exc_info=True)
+        else:
+            print('Embedded OLE object risk: %s (confidence: %s)'
+                  % (risk.risk, risk.confidence))
+            for reason in risk.reasons:
+                print('  - %s' % reason)
 
         for path_parts in ole.listdir():
             stream_path = '/'.join(path_parts)

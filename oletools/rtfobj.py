@@ -95,6 +95,15 @@ http://www.decalage.info/python/oletools
 # 2021-05-23 v0.60   PL: - use ftguess to identify file type of OLE Package
 #                        - fixed bug in re_executable_extensions
 # 2021-06-03 v0.60.1 PL: - fixed code to find URLs in OLE2Link objects for Py3 (issue #692)
+# 2026-02-09       : - each embedded object now carries an explainable risk
+#                      grade (HIGH/MEDIUM/LOW/UNKNOWN + confidence and reasons)
+#                      from common.clsid, based on object type, CLSID source
+#                      and exact suspicious command/script indicators
+#                    - parse errors are recorded on RtfObject.parse_error
+#                      instead of being silently swallowed, so corrupted
+#                      objects are graded malformed and never reported safe
+#                    - fixed isOleFile check on short payloads (olefile treats
+#                      small bytes as a file name; same workaround as ftguess)
 
 from __future__ import print_function
 
@@ -650,6 +659,11 @@ class RtfObject(object):
         # Additional OLE object data
         self.clsid = None
         self.clsid_desc = None
+        # Risk grading (see oletools.common.clsid): None until the object has
+        # been assessed, then an EmbeddedObjectRiskAssessment instance.
+        self.risk_assessment = None
+        # Error captured while parsing the embedded OLE structure, if any:
+        self.parse_error = None
 
 
 
@@ -701,7 +715,7 @@ class RtfObjParser(RtfParser):
                 rtfobj.class_name = obj.class_name
                 rtfobj.oledata_size = obj.data_size
                 rtfobj.oledata = obj.data
-                rtfobj.oledata_md5 = hashlib.md5(obj.data).hexdigest()         
+                rtfobj.oledata_md5 = hashlib.md5(obj.data).hexdigest()
                 rtfobj.is_ole = True
                 if obj.class_name.lower().rstrip(b'\0') == b'package':
                     opkg = oleobj.OleNativeStream(bindata=obj.data,
@@ -715,14 +729,63 @@ class RtfObjParser(RtfParser):
                     rtfobj.ftg = ftguess.FileTypeGuesser(data=rtfobj.olepkgdata)
                     rtfobj.is_package = True
                 else:
-                    if olefile.isOleFile(obj.data):
+                    # olefile.isOleFile treats bytes shorter than 1536 as a
+                    # file name (see ftguess for the same workaround); pad a
+                    # short payload so a well-formed OLE1 object with a small
+                    # non-OLE embedded payload is not mistaken for a malformed
+                    # object:
+                    ole_payload = obj.data
+                    if ole_payload is not None and len(ole_payload) < 1536:
+                        ole_payload = ole_payload + (b'\x00' * 1536)
+                    if olefile.isOleFile(ole_payload):
                         ole = olefile.OleFileIO(obj.data)
                         rtfobj.clsid = ole.root.clsid
                         rtfobj.clsid_desc = clsid.KNOWN_CLSIDS.get(rtfobj.clsid.upper(),
                             'unknown CLSID (please report at https://github.com/decalage2/oletools/issues)')
-            except:
-                pass
-                log.debug('*** Not an OLE 1.0 Object')
+            except Exception as exc:
+                # Keep the permissive historical behaviour (a bad object does
+                # not abort the whole RTF parse), but remember the cause so a
+                # malformed object can be graded as such instead of being
+                # silently treated as safe:
+                rtfobj.parse_error = '{0}: {1}'.format(
+                    type(exc).__name__, exc)
+                log.debug('*** Not an OLE 1.0 Object', exc_info=True)
+
+            # Risk grading based on object type, CLSID provenance and exact
+            # command/script indicators. Runs even when parsing failed above,
+            # which is precisely when an explainable low-confidence result is
+            # required.
+            rtfobj.risk_assessment = self._assess_object_risk(rtfobj)
+
+    def _assess_object_risk(self, rtfobj):
+        """
+        Build an EmbeddedObjectRiskAssessment for a parsed RtfObject.
+
+        The assessment only uses structural evidence (object type from the
+        OLE1 format_id, CLSID read from the OLE storage root, exact class-name
+        rules, and word-boundary command/script indicators) - never CLSID
+        string similarity.
+        """
+        if not rtfobj.is_ole or rtfobj.parse_error is not None:
+            object_type = clsid.OBJECT_TYPE_MALFORMED
+        elif rtfobj.is_package:
+            object_type = clsid.OBJECT_TYPE_PACKAGE
+        elif rtfobj.format_id == oleobj.OleObject.TYPE_LINKED:
+            object_type = clsid.OBJECT_TYPE_LINKED
+        elif rtfobj.format_id == oleobj.OleObject.TYPE_EMBEDDED:
+            object_type = clsid.OBJECT_TYPE_EMBEDDED
+        else:
+            object_type = clsid.OBJECT_TYPE_UNKNOWN
+        # scan the OLE1 object data when available, else the raw decoded blob:
+        indicators_data = rtfobj.oledata
+        if indicators_data is None:
+            indicators_data = rtfobj.rawdata
+        return clsid.assess_embedded_object(
+            clsid=rtfobj.clsid,
+            class_name=rtfobj.class_name,
+            object_type=object_type,
+            indicators_data=indicators_data,
+            clsid_source=clsid.CLSID_SOURCE_OLE_STORAGE)
 
     def bin(self, bindata):
         if self.current_destination.cword == b'objdata':
@@ -850,6 +913,39 @@ def sanitize_filename(filename, replacement='_', max_length=200):
     return sane_fname
 
 
+def _format_risk(rtfobj, ole_column, ole_color):
+    """
+    Append the structured risk grade of an RtfObject to its table cell.
+
+    Purely additive: existing cell content and colour decisions are preserved.
+    HIGH grades render red, MEDIUM yellow; malformed/unknown objects render
+    magenta so they are visually distinct from known-safe (green/default) ones.
+    """
+    assessment = rtfobj.risk_assessment
+    if assessment is None:
+        return ole_column, ole_color
+    ole_column += '\nRisk: {0} (confidence: {1})'.format(
+        assessment.risk, assessment.confidence)
+    for reason in assessment.reasons:
+        ole_column += '\n  - {0}'.format(reason)
+    if assessment.indicators:
+        # Indicator ids already appear (by design) inside the reasons list,
+        # so add matched samples here instead of repeating the id list.
+        samples = ', '.join(sorted({item['match']
+                                    for item in assessment.indicators}))
+        ole_column += '\nSuspicious indicator matches: {0}'.format(samples)
+    if rtfobj.parse_error is not None:
+        ole_column += '\nParse error: {0}'.format(rtfobj.parse_error)
+    if assessment.risk == clsid.RISK_HIGH:
+        ole_color = 'red'
+    elif assessment.risk == clsid.RISK_MEDIUM:
+        if ole_color != 'red':
+            ole_color = 'yellow'
+    elif assessment.risk == clsid.RISK_UNKNOWN and ole_color is None:
+        ole_color = 'magenta'
+    return ole_column, ole_color
+
+
 def process_file(container, filename, data, output_dir=None, save_object=False):
     if output_dir:
         if not os.path.isdir(output_dir):
@@ -943,8 +1039,16 @@ def process_file(container, filename, data, output_dir=None, save_object=False):
             elif rtfobj.class_name.lower().startswith(b'equation.3'):
                 ole_color = 'red'
                 ole_column += '\nPossibly an exploit for the Equation Editor vulnerability (VU#421280, CVE-2017-11882)'
+            # Append the structured risk grade and its evidence. This only adds
+            # lines to the existing output; all fields above are unchanged.
+            ole_column, ole_color = _format_risk(
+                rtfobj, ole_column, ole_color)
         else:
             ole_column = 'Not a well-formed OLE object'
+            # A malformed object must never read as safe: show the explicit
+            # low-confidence/unknown grade and the parse error when available.
+            ole_column, ole_color = _format_risk(
+                rtfobj, ole_column, ole_color)
         tstream.write_row((
             rtfp.objects.index(rtfobj),
             # filename,
