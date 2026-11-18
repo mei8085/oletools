@@ -313,7 +313,7 @@ from pyparsing import \
         CaselessKeyword, CaselessLiteral, Combine, Forward, Literal, \
         Optional, QuotedString,Regex, Suppress, Word, WordStart, \
         alphanums, alphas, hexnums,nums, opAssoc, srange, \
-        infixNotation, ParserElement
+        infixNotation, ParserElement, oneOf, FollowedBy
 
 # attempt to import XLMMacroDeobfuscator (optional)
 try:
@@ -371,7 +371,6 @@ else:
     unichr = chr
     # json2ascii also needs "unicode":
     unicode = str
-    from functools import reduce
     #: Default string encoding for the olevba API
     DEFAULT_API_ENCODING = None  # on Python 3: None (unicode)
     # Python 3.0 - 3.4 support:
@@ -935,6 +934,88 @@ class VbaExpressionString(str):
     pass
 
 
+# --- CONTROLLED EVALUATION ERRORS --------------------------------------------
+
+# Maximum nesting depth of parentheses accepted in a VBA expression.
+# Deeper expressions are rejected with a controlled VbaEvaluationError instead
+# of exhausting the Python call stack (malicious input may nest thousands of
+# levels deep to crash or slow down the parser).
+MAX_VBA_EXPR_DEPTH = 100
+
+# Recursion limit required to parse expressions nested MAX_VBA_EXPR_DEPTH deep.
+# (pyparsing uses several dozen Python frames per nesting level; on Python
+# 3.11+ those frames do not consume the C stack, so a higher limit is safe)
+VBA_EXPR_RECURSION_LIMIT = 20000
+
+# VBA Long data type range (32-bit signed integer), MS-VBAL 2.1
+VBA_LONG_MIN = -2147483648
+VBA_LONG_MAX = 2147483647
+
+
+class VbaEvaluationError(Exception):
+    """
+    Controlled error produced when a VBA expression cannot be evaluated
+    safely during deobfuscation (unknown function, default property/member
+    access, integer overflow, excessive nesting depth, ...).
+
+    It is used as a sentinel value by the expression parse actions, and
+    collected by detect_vba_strings so that the caller can report it.
+    It always carries enough information to locate the offending expression
+    in the original VBA code, and it NEVER triggers any external action
+    (no command execution, no file/network access).
+
+    Attributes:
+    - message: str, description of the error (e.g. VBA runtime error 6/13)
+    - expr: str or None, source text of the offending expression
+    - line: int or None, 1-based line number in the VBA code
+    - col: int or None, 1-based column of the expression in that line
+    """
+
+    def __init__(self, message, expr=None, line=None, col=None):
+        super(VbaEvaluationError, self).__init__(message)
+        self.message = message
+        self.expr = expr
+        self.line = line
+        self.col = col
+
+    def __str__(self):
+        location = ''
+        if self.line is not None:
+            location = ' at line %d' % self.line
+            if self.col is not None:
+                location += ', column %d' % self.col
+        expr = ''
+        if self.expr is not None:
+            expr = ' [%s]' % self.expr
+        return '%s%s%s' % (self.message, location, expr)
+
+
+def _first_error(values):
+    """
+    Return the first VbaEvaluationError found in values, or None.
+    Used by parse actions to propagate controlled errors up the expression
+    tree, so that a single failing sub-expression aborts the evaluation of
+    the whole expression without raising an exception.
+    """
+    for value in values:
+        if isinstance(value, VbaEvaluationError):
+            return value
+    return None
+
+
+def _check_long(value):
+    """
+    Check that an integer result fits in the VBA Long data type (32-bit
+    signed). Returns the value unchanged, or a VbaEvaluationError for
+    VBA runtime error 6 (Overflow). Floats (VBA Double) are returned as-is.
+    """
+    if isinstance(value, float):
+        return value
+    if value < VBA_LONG_MIN or value > VBA_LONG_MAX:
+        return VbaEvaluationError('Overflow (VBA runtime error 6)')
+    return value
+
+
 # --- NUMBER TOKENS ----------------------------------------------------------
 
 # 3.3.2 Number Tokens
@@ -1035,26 +1116,42 @@ vba_expr_int = Forward()
 # is String rather than Variant.
 
 # Chr, Chr$, ChrB, ChrW(int) => char
-vba_chr = Suppress(
-            Combine(WordStart(vba_identifier_chars) + CaselessLiteral('Chr')
+# the function name is captured (not suppressed) so that the parse action can
+# apply the proper value range for each variant (Chr/ChrB/ChrW)
+vba_chr_func = Combine(WordStart(vba_identifier_chars) + CaselessLiteral('Chr')
             + Optional(CaselessLiteral('B') | CaselessLiteral('W')) + Optional('$'))
-            + '(') + vba_expr_int + Suppress(')')
+vba_chr = vba_chr_func + Suppress('(') + vba_expr_int + Suppress(')')
 
 def vba_chr_tostr(t):
-    try:
-        i = t[0]
-        if i>=0 and i<=255:
-            # normal, non-unicode character:
-            # TODO: check if it needs to be converted to bytes for Python 3
+    func = t[0].lower().rstrip('$')
+    i = t[1]
+    # propagate a controlled error from the argument expression, if any:
+    if isinstance(i, VbaEvaluationError):
+        return i
+    # VBA converts the argument to Long before the call: non-integer values
+    # are rounded half to even (banker's rounding), like CInt/CLng:
+    if isinstance(i, float):
+        i = int(round(i))
+    if func == 'chrw':
+        # ChrW: -32,768 to 65,535, negative values are taken modulo 65,536,
+        # otherwise error 5 "Invalid procedure call or argument"
+        if -32768 <= i <= 65535:
+            return VbaExpressionString(chr(i % 65536))
+        return VbaEvaluationError(
+            'Invalid procedure call or argument (VBA runtime error 5): '
+            'ChrW(%d) out of range -32768..65535' % i)
+    if func == 'chrb':
+        # ChrB: 0 to 255, otherwise error 6 "Overflow"
+        if 0 <= i <= 255:
             return VbaExpressionString(chr(i))
-        else:
-            # unicode character
-            # Note: this distinction is only needed for Python 2
-            # pylint: disable-next=possibly-used-before-assignment
-            return VbaExpressionString(unichr(i).encode('utf-8', 'backslashreplace'))
-    except ValueError:
-        log.exception('ERROR: incorrect parameter value for chr(): %r' % i)
-        return VbaExpressionString('Chr(%r)' % i)
+        return VbaEvaluationError(
+            'Overflow (VBA runtime error 6): ChrB(%d) out of range 0..255' % i)
+    # Chr/Chr$: 0 to 255, otherwise error 5 "Invalid procedure call or argument"
+    if 0 <= i <= 255:
+        return VbaExpressionString(chr(i))
+    return VbaEvaluationError(
+        'Invalid procedure call or argument (VBA runtime error 5): '
+        'Chr(%d) out of range 0..255' % i)
 
 vba_chr.setParseAction(vba_chr_tostr)
 
@@ -1064,29 +1161,91 @@ vba_chr.setParseAction(vba_chr_tostr)
 # Asc(char) => int
 #TODO: see MS-VBAL 6.1.2.11.1.1 page 240 => AscB, AscW
 vba_asc = Suppress(CaselessKeyword('Asc') + '(') + vba_expr_str + Suppress(')')
-vba_asc.setParseAction(lambda t: ord(t[0]))
+
+def vba_asc_toint(t):
+    s = t[0]
+    # propagate a controlled error from the argument expression, if any:
+    if isinstance(s, VbaEvaluationError):
+        return s
+    if len(s) == 0:
+        # VBA raises error 5 "Invalid procedure call or argument" on Asc("")
+        return VbaEvaluationError(
+            'Invalid procedure call or argument (VBA runtime error 5): Asc("")')
+    # VBA only uses the first character of the string:
+    return ord(s[0])
+
+vba_asc.setParseAction(vba_asc_toint)
 
 
 # --- VAL --------------------------------------------------------------------
 
-# Val(string) => int
-# TODO: make sure the behavior of VBA's val is fully covered
+# Val(string) => number
+# VBA's Val reads the longest numeric prefix of the string (after leading
+# whitespace), supports &H/&O hexadecimal/octal prefixes, and returns 0 when
+# the string does not start with a number. It never raises an error.
 vba_val = Suppress(CaselessKeyword('Val') + '(') + vba_expr_str + Suppress(')')
-vba_val.setParseAction(lambda t: int(t[0].strip()))
+
+# numeric prefix recognized by VBA's Val: optional sign, decimal digits with
+# an optional fractional part and optional exponent
+VAL_DECIMAL_RE = re.compile(r'^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?')
+# hexadecimal/octal prefix recognized by VBA's Val, e.g. &H1F or &O17
+VAL_HEX_RE = re.compile(r'^([+-]?)&[hH]([0-9a-fA-F]+)')
+VAL_OCT_RE = re.compile(r'^([+-]?)&[oO]([0-7]+)')
+
+def vba_val_tonum(t):
+    s = t[0]
+    # propagate a controlled error from the argument expression, if any:
+    if isinstance(s, VbaEvaluationError):
+        return s
+    s = s.strip()
+    m = VAL_HEX_RE.match(s)
+    if m is not None:
+        value = int(m.group(2), 16)
+        return -value if m.group(1) == '-' else value
+    m = VAL_OCT_RE.match(s)
+    if m is not None:
+        value = int(m.group(2), 8)
+        return -value if m.group(1) == '-' else value
+    m = VAL_DECIMAL_RE.match(s)
+    if m is not None:
+        text = m.group(0)
+        if '.' in text or 'e' in text or 'E' in text:
+            return float(text)
+        return int(text)
+    # VBA's Val returns 0 when the string does not start with a number:
+    return 0
+
+vba_val.setParseAction(vba_val_tonum)
 
 
 # --- StrReverse() --------------------------------------------------------------------
 
 # StrReverse(string) => string
 strReverse = Suppress(CaselessKeyword('StrReverse') + '(') + vba_expr_str + Suppress(')')
-strReverse.setParseAction(lambda t: VbaExpressionString(str(t[0])[::-1]))
+
+def vba_strreverse(t):
+    s = t[0]
+    # propagate a controlled error from the argument expression, if any:
+    if isinstance(s, VbaEvaluationError):
+        return s
+    return VbaExpressionString(str(s)[::-1])
+
+strReverse.setParseAction(vba_strreverse)
 
 
 # --- ENVIRON() --------------------------------------------------------------------
 
 # Environ("name") => just translated to "%name%", that is enough for malware analysis
 environ = Suppress(CaselessKeyword('Environ') + '(') + vba_expr_str + Suppress(')')
-environ.setParseAction(lambda t: VbaExpressionString('%%%s%%' % t[0]))
+
+def vba_environ(t):
+    s = t[0]
+    # propagate a controlled error from the argument expression, if any:
+    if isinstance(s, VbaEvaluationError):
+        return s
+    return VbaExpressionString('%%%s%%' % s)
+
+environ.setParseAction(vba_environ)
 
 
 # --- IDENTIFIER -------------------------------------------------------------
@@ -1098,51 +1257,195 @@ environ.setParseAction(lambda t: VbaExpressionString('%%%s%%' % t[0]))
 # subsequent-Latin-identifier-character = first-Latin-identifier-character / DIGIT / %x5F ; underscore
 latin_identifier = Word(initChars=alphas, bodyChars=alphanums + '_')
 
-# --- HEX FUNCTION -----------------------------------------------------------
+# --- IDENTIFIER-LED CONSTRUCTS -------------------------------------------------
+# (hex/base64 decoder functions, unknown function calls, member access)
 
-# match any custom function name with a hex string as argument:
+# match any custom function name with a hex or Base64 string as argument:
 # TODO: accept vba_expr_str_item as argument, check if it is a hex or base64 string at runtime
 
 # quoted string of at least two hexadecimal numbers of two digits:
 quoted_hex_string = Suppress('"') + Combine(Word(hexnums, exact=2) * (2, None)) + Suppress('"')
 quoted_hex_string.setParseAction(lambda t: str(t[0]))
 
-hex_function_call = Suppress(latin_identifier) + Suppress('(') + \
-                    quoted_hex_string('hex_string') + Suppress(')')
-hex_function_call.setParseAction(lambda t: VbaExpressionString(binascii.a2b_hex(t.hex_string)))
-
-
-# --- BASE64 FUNCTION -----------------------------------------------------------
-
-# match any custom function name with a Base64 string as argument:
-# TODO: accept vba_expr_str_item as argument, check if it is a hex or base64 string at runtime
-
-# quoted string of at least two hexadecimal numbers of two digits:
+# quoted Base64 string:
 quoted_base64_string = Suppress('"') + Regex(BASE64_RE) + Suppress('"')
 quoted_base64_string.setParseAction(lambda t: str(t[0]))
 
-base64_function_call = Suppress(latin_identifier) + Suppress('(') + \
-                    quoted_base64_string('base64_string') + Suppress(')')
-base64_function_call.setParseAction(lambda t: VbaExpressionString(binascii.a2b_base64(t.base64_string)))
+# arguments of a call without nested parentheses, e.g. ("abc", 12) - matching
+# them with a regex is much faster than nestedExpr for the parser
+flat_call_args = Regex(r'\([^()]*\)')
+
+# All identifier-led constructs are matched by this single rule, so that the
+# identifier is only parsed once per position (much faster than separate
+# alternatives):
+# - custom hex/Base64 decoder functions, e.g. dhex("636D64") => decoded
+# - member access such as obj.Member, obj.Member(...) or obj.ctor(...).Member,
+#   which resolves through the object's default property/method at runtime:
+#   it cannot be resolved statically, return a controlled error instead of
+#   executing anything
+# - any other function call which is not a known VBA function: do NOT execute
+#   anything, return a controlled error instead
+# (when the arguments contain nested parentheses, only the opening parenthesis
+# is matched: the error still points at the offending construct, and any
+# deobfuscatable sub-expression inside the arguments is still detected)
+# known VBA functions handled by their own rules: they must not be matched as
+# unknown functions or hex/base64 decoders by identifier_construct
+KNOWN_VBA_FUNC_RE = Regex(r'(?!(?:chr[bw]?\$?|asc|val|strreverse|environ)\b)',
+                          re.IGNORECASE)
+
+identifier_construct = WordStart(vba_identifier_chars) + \
+    KNOWN_VBA_FUNC_RE + \
+    latin_identifier('name') + FollowedBy(Regex(r'\s*[.(]')) + (
+        (Suppress('(') + quoted_hex_string('hex_string') + Suppress(')'))
+        | (Suppress('(') + quoted_base64_string('base64_string') + Suppress(')'))
+        | (Optional(flat_call_args) + Literal('.') + latin_identifier
+           + Optional(flat_call_args))('member')
+        | (flat_call_args | Literal('('))('call')
+    )
+
+def vba_identifier_construct(t):
+    if 'hex_string' in t:
+        # custom hex decoder function, e.g. dhex("636D64")
+        try:
+            return VbaExpressionString(binascii.a2b_hex(t.hex_string))
+        except (binascii.Error, ValueError) as exc:
+            return VbaEvaluationError(
+                'Failed to decode hexadecimal string: %s' % exc)
+    if 'base64_string' in t:
+        # custom Base64 decoder function, e.g. b64("Y2FsYw==")
+        try:
+            return VbaExpressionString(binascii.a2b_base64(t.base64_string))
+        except (binascii.Error, ValueError) as exc:
+            return VbaEvaluationError(
+                'Failed to decode Base64 string: %s' % exc)
+    if 'member' in t:
+        # default property / member access: cannot be resolved statically
+        return VbaEvaluationError(
+            'Cannot evaluate default property or member access statically '
+            '(no external action performed)')
+    # any other function call: unknown function, do not execute anything
+    return VbaEvaluationError(
+        'Unknown function %r cannot be evaluated safely '
+        '(no external action performed)' % t.name)
+
+identifier_construct.setParseAction(vba_identifier_construct)
 
 
 # ---STRING EXPRESSION -------------------------------------------------------
 
+def _vba_to_string(value):
+    """
+    Convert a value to a string the way VBA does for the '&' concatenation
+    operator (CStr semantics): numbers are rendered in decimal without any
+    leading space, e.g. "a" & 1234 => "a1234".
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, float):
+        # VBA renders integral Doubles without decimal separator: CStr(5.0)="5"
+        if value == int(value) and abs(value) < 1e15:
+            return str(int(value))
+        return repr(value)
+    return str(value)
+
+
+def _vba_to_number(value):
+    """
+    Convert a string to a number the way VBA does when a string is used in a
+    numeric operation (e.g. "5" + 3 => 8). Returns a VbaEvaluationError for
+    VBA runtime error 13 (Type mismatch) if the string is not numeric.
+    """
+    text = value.strip()
+    if re.match(r'^[+-]?\d+$', text):
+        return int(text)
+    if re.match(r'^[+-]?(\d+\.\d*|\.\d+|\d+)([eE][+-]?\d+)?$', text):
+        return float(text)
+    m = VAL_HEX_RE.match(text)
+    if m is not None and m.end() == len(text):
+        num = int(m.group(2), 16)
+        return -num if m.group(1) == '-' else num
+    m = VAL_OCT_RE.match(text)
+    if m is not None and m.end() == len(text):
+        num = int(m.group(2), 8)
+        return -num if m.group(1) == '-' else num
+    return VbaEvaluationError(
+        'Type mismatch (VBA runtime error 13): cannot convert %r to a number'
+        % value)
+
+
+def _vba_plus(a, b):
+    """
+    VBA semantics of the '+' operator on two values (MS-VBAL 5.6.9.5):
+    - string + string => concatenation
+    - number + number => numeric addition
+    - string + number => the string is converted to a number and added
+      (error 13 "Type mismatch" if it is not numeric)
+    """
+    if isinstance(a, str) and isinstance(b, str):
+        return VbaExpressionString(a + b)
+    if isinstance(a, str):
+        a = _vba_to_number(a)
+        if isinstance(a, VbaEvaluationError):
+            return a
+    if isinstance(b, str):
+        b = _vba_to_number(b)
+        if isinstance(b, VbaEvaluationError):
+            return b
+    return _check_long(a + b)
+
+
 def concat_strings_list(tokens):
     """
-    parse action to concatenate strings in a VBA expression with operators '+' or '&'
+    parse action to concatenate values in a VBA expression with operator '&'
+    (VBA converts numbers to strings, e.g. "id" & 1234 => "id1234")
     """
     # extract argument from the tokens:
-    # expected to be a tuple containing a list of strings such as [a,'&',b,'&',c,...]
-    strings = tokens[0][::2]
-    return VbaExpressionString(''.join(strings))
+    # expected to be a tuple containing a list of values such as [a,'&',b,'&',c,...]
+    values = tokens[0][::2]
+    # propagate a controlled error from any operand, if any:
+    error = _first_error(values)
+    if error is not None:
+        return error
+    return VbaExpressionString(''.join(_vba_to_string(v) for v in values))
 
 
-vba_expr_str_item = (vba_chr | strReverse | environ | quoted_string | hex_function_call | base64_function_call)
+def plus_values_list(tokens):
+    """
+    parse action for the '+' operator in VBA string expressions, applying
+    VBA Variant semantics (concatenation or numeric addition depending on
+    the operand types), evaluated left to right.
+    """
+    # extract argument from the tokens:
+    # expected to be a tuple containing a list of values such as [a,'+',b,'+',c,...]
+    values = tokens[0][::2]
+    # propagate a controlled error from any operand, if any:
+    error = _first_error(values)
+    if error is not None:
+        return error
+    result = values[0]
+    for value in values[1:]:
+        result = _vba_plus(result, value)
+        if isinstance(result, VbaEvaluationError):
+            return result
+    return result
+
+
+# fast lookahead: an integer expression can only start with a digit, a sign,
+# an octal/hex prefix '&', an opening parenthesis, or the Asc/Val/True/False
+# keywords (and not right after another identifier character). Checking this
+# first is much faster than trying the whole integer expression grammar at
+# every position.
+INT_EXPR_START_RE = Regex(
+    r'(?<![A-Za-z0-9_])(?:[0-9&(\-]|(?:asc|val|true|false)\b)', re.IGNORECASE)
+
+vba_expr_str_item = (vba_chr | strReverse | environ | quoted_string
+                     | identifier_construct
+                     | Suppress('(') + vba_expr_str + Suppress(')')
+                     | FollowedBy(INT_EXPR_START_RE) + vba_expr_int)
 
 vba_expr_str <<= infixNotation(vba_expr_str_item,
     [
-        ("+", 2, opAssoc.LEFT, concat_strings_list),
+        ("+", 2, opAssoc.LEFT, plus_values_list),
         ("&", 2, opAssoc.LEFT, concat_strings_list),
     ])
 
@@ -1152,48 +1455,174 @@ vba_expr_str <<= infixNotation(vba_expr_str_item,
 def sum_ints_list(tokens):
     """
     parse action to sum integers in a VBA expression with operator '+'
+    (results are checked against the VBA Long range: overflow => error 6)
     """
     # extract argument from the tokens:
-    # expected to be a tuple containing a list of integers such as [a,'&',b,'&',c,...]
+    # expected to be a tuple containing a list of integers such as [a,'+',b,'+',c,...]
     integers = tokens[0][::2]
-    return sum(integers)
+    # propagate a controlled error from any operand, if any:
+    error = _first_error(integers)
+    if error is not None:
+        return error
+    result = 0
+    for i in integers:
+        result = _check_long(result + i)
+        if isinstance(result, VbaEvaluationError):
+            return result
+    return result
 
 
 def subtract_ints_list(tokens):
     """
     parse action to subtract integers in a VBA expression with operator '-'
+    (results are checked against the VBA Long range: overflow => error 6)
     """
     # extract argument from the tokens:
-    # expected to be a tuple containing a list of integers such as [a,'&',b,'&',c,...]
+    # expected to be a tuple containing a list of integers such as [a,'-',b,'-',c,...]
     integers = tokens[0][::2]
-    # pylint: disable-next=possibly-used-before-assignment
-    return reduce(lambda x,y:x-y, integers)
+    # propagate a controlled error from any operand, if any:
+    error = _first_error(integers)
+    if error is not None:
+        return error
+    result = integers[0]
+    for i in integers[1:]:
+        result = _check_long(result - i)
+        if isinstance(result, VbaEvaluationError):
+            return result
+    return result
 
 
 def multiply_ints_list(tokens):
     """
     parse action to multiply integers in a VBA expression with operator '*'
+    (results are checked against the VBA Long range: overflow => error 6)
     """
     # extract argument from the tokens:
-    # expected to be a tuple containing a list of integers such as [a,'&',b,'&',c,...]
+    # expected to be a tuple containing a list of integers such as [a,'*',b,'*',c,...]
     integers = tokens[0][::2]
-    return reduce(lambda x,y:x*y, integers)
+    # propagate a controlled error from any operand, if any:
+    error = _first_error(integers)
+    if error is not None:
+        return error
+    result = 1
+    for i in integers:
+        result = _check_long(result * i)
+        if isinstance(result, VbaEvaluationError):
+            return result
+    return result
 
 
 def divide_ints_list(tokens):
     """
-    parse action to divide integers in a VBA expression with operator '/'
+    parse action to divide numbers in a VBA expression with operator '/'
+    (VBA's '/' is a floating-point division; division by zero => error 11)
     """
     # extract argument from the tokens:
-    # expected to be a tuple containing a list of integers such as [a,'&',b,'&',c,...]
-    integers = tokens[0][::2]
-    return reduce(lambda x,y:x/y, integers)
+    # expected to be a tuple containing a list of numbers such as [a,'/',b,'/',c,...]
+    numbers = tokens[0][::2]
+    # propagate a controlled error from any operand, if any:
+    error = _first_error(numbers)
+    if error is not None:
+        return error
+    result = numbers[0]
+    for i in numbers[1:]:
+        if i == 0:
+            return VbaEvaluationError('Division by zero (VBA runtime error 11)')
+        result = result / i
+    return result
 
 
-vba_expr_int_item = (vba_asc | vba_val | integer)
+# --- BOOLEAN LITERALS -----------------------------------------------------------
+
+# VBA boolean literals: True is -1, False is 0 when converted to a number
+vba_true = CaselessKeyword('True')
+vba_true.setParseAction(lambda t: -1)
+vba_false = CaselessKeyword('False')
+vba_false.setParseAction(lambda t: 0)
+
+
+# --- COMPARISON OPERATORS -------------------------------------------------------
+
+# VBA comparison operators return -1 (True) or 0 (False)
+_VBA_COMPARE_OPS = {
+    '=':  lambda a, b: a == b,
+    '<>': lambda a, b: a != b,
+    '<':  lambda a, b: a < b,
+    '>':  lambda a, b: a > b,
+    '<=': lambda a, b: a <= b,
+    '>=': lambda a, b: a >= b,
+}
+
+def compare_ints_list(tokens):
+    """
+    parse action for VBA comparison operators (=, <>, <, >, <=, >=),
+    returning -1 for True and 0 for False, evaluated left to right.
+    """
+    items = tokens[0]
+    # propagate a controlled error from any operand, if any:
+    error = _first_error(items[::2])
+    if error is not None:
+        return error
+    result = items[0]
+    for i in range(1, len(items), 2):
+        op = items[i]
+        operand = items[i + 1]
+        try:
+            result = -1 if _VBA_COMPARE_OPS[op](result, operand) else 0
+        except TypeError:
+            return VbaEvaluationError(
+                'Type mismatch (VBA runtime error 13): cannot compare %r %s %r'
+                % (result, op, operand))
+    return result
+
+
+# --- LOGICAL OPERATORS ----------------------------------------------------------
+
+# NOTE: VBA's logical operators (And, Or, Xor, Eqv, Imp, Not) are bitwise
+# operators on Long integers and do NOT short-circuit: both operands are
+# always evaluated. This is safe here because this evaluator only handles
+# constant expressions and never executes external actions: an operand that
+# cannot be evaluated statically (unknown function, member access, ...)
+# becomes a controlled VbaEvaluationError which is simply propagated.
+
+def _make_logic_op_list(func):
+    """
+    Build a parse action folding a VBA bitwise logical operator over a list
+    of operands, e.g. [a, 'And', b, 'And', c].
+    """
+    def logic_op_list(tokens):
+        operands = tokens[0][::2]
+        # propagate a controlled error from any operand, if any:
+        error = _first_error(operands)
+        if error is not None:
+            return error
+        result = operands[0]
+        for operand in operands[1:]:
+            result = _check_long(func(result, operand))
+            if isinstance(result, VbaEvaluationError):
+                return result
+        return result
+    return logic_op_list
+
+
+def not_int(tokens):
+    """
+    parse action for VBA's unary Not operator (bitwise NOT: Not x = -x-1)
+    """
+    operand = tokens[0][1]
+    # propagate a controlled error from the operand, if any:
+    if isinstance(operand, VbaEvaluationError):
+        return operand
+    return _check_long(~operand)
+
+
+vba_expr_int_item = (vba_asc | vba_val | vba_true | vba_false | integer
+                     | Suppress('(') + vba_expr_int + Suppress(')'))
 
 # operators associativity:
 # https://en.wikipedia.org/wiki/Operator_associativity
+# VBA operator precedence (MS-VBAL 5.6.9): arithmetic first, then comparison,
+# then Not, And, Or, Xor, Eqv, Imp.
 
 vba_expr_int <<= infixNotation(vba_expr_int_item,
     [
@@ -1201,6 +1630,13 @@ vba_expr_int <<= infixNotation(vba_expr_int_item,
         ("/", 2, opAssoc.LEFT, divide_ints_list),
         ("-", 2, opAssoc.LEFT, subtract_ints_list),
         ("+", 2, opAssoc.LEFT, sum_ints_list),
+        (oneOf('= <> <= >= < >'), 2, opAssoc.LEFT, compare_ints_list),
+        (CaselessKeyword('Not'), 1, opAssoc.RIGHT, not_int),
+        (CaselessKeyword('And'), 2, opAssoc.LEFT, _make_logic_op_list(lambda a, b: a & b)),
+        (CaselessKeyword('Or'), 2, opAssoc.LEFT, _make_logic_op_list(lambda a, b: a | b)),
+        (CaselessKeyword('Xor'), 2, opAssoc.LEFT, _make_logic_op_list(lambda a, b: a ^ b)),
+        (CaselessKeyword('Eqv'), 2, opAssoc.LEFT, _make_logic_op_list(lambda a, b: ~(a ^ b))),
+        (CaselessKeyword('Imp'), 2, opAssoc.LEFT, _make_logic_op_list(lambda a, b: ~a | b)),
     ])
 
 
@@ -2376,40 +2812,125 @@ def detect_dridex_strings(vba_code):
     return results
 
 
-def detect_vba_strings(vba_code):
+# Characters that are always present in a VBA expression which can produce a
+# deobfuscated string or a controlled evaluation error: string concatenation
+# and operators (& + - * /), function calls and parentheses ( ), member
+# access (.) and string literals ("). Lines without any of them cannot
+# contain a deobfuscatable expression and are skipped, which makes scanning
+# large benign scripts much faster.
+VBA_EXPR_TRIGGER_RE = re.compile(r'[&+\-*/()."]')
+
+
+def vba_expression_depth(vba_line):
+    """
+    Compute the maximum parenthesis nesting depth of a line of VBA code.
+
+    Parentheses are counted everywhere on the line, including inside string
+    literals and comments, because the expression parser recurses into those
+    parentheses as well: this check must reflect the actual recursion risk
+    (a line full of nested parentheses is a classic parser DoS attempt).
+
+    :param vba_line: str, one line of VBA source code
+    :return: int, maximum nesting depth of parentheses
+    """
+    depth = 0
+    max_depth = 0
+    for char in vba_line:
+        if char == '(':
+            depth += 1
+            if depth > max_depth:
+                max_depth = depth
+        elif char == ')':
+            depth = max(0, depth - 1)
+    return max_depth
+
+
+def detect_vba_strings(vba_code, errors=None):
     """
     Detect if the VBA code contains strings obfuscated with VBA expressions
     using keywords such as Chr, Asc, Val, StrReverse, etc.
 
+    Unknown functions, default property/member accesses, integer overflows,
+    excessively nested (potentially malicious) expressions and other
+    non-evaluable constructs never trigger any external action: they produce
+    controlled VbaEvaluationError errors with the location of the offending
+    expression, and the rest of the code keeps being processed.
+
     :param vba_code: str, VBA source code
+    :param errors: optional list; if provided, each VbaEvaluationError
+        encountered during evaluation is appended to it (with line/column
+        information). If None, errors are only logged at debug level.
     :return: list of str tuples (encoded string, decoded string)
     """
-    # TODO: handle exceptions
     results = []
     found = set()
     # IMPORTANT: to extract the actual VBA expressions found in the code,
     #            we must expand tabs to have the same string as pyparsing.
     #            Otherwise, start and end offsets are incorrect.
     vba_code = vba_code.expandtabs()
-    # Split the VBA code line by line to avoid MemoryError on large scripts:
-    for vba_line in vba_code.splitlines():
-        for tokens, start, end in vba_expr_str.scanString(vba_line):
-            encoded = vba_line[start:end]
-            decoded = tokens[0]
-            if isinstance(decoded, VbaExpressionString):
-                # This is a VBA expression, not a simple string
-                # print 'VBA EXPRESSION: encoded=%r => decoded=%r' % (encoded, decoded)
-                # remove parentheses and quotes from original string:
-                # if encoded.startswith('(') and encoded.endswith(')'):
-                #     encoded = encoded[1:-1]
-                # if encoded.startswith('"') and encoded.endswith('"'):
-                #     encoded = encoded[1:-1]
-                # avoid duplicates and simple strings:
-                if encoded not in found and decoded != encoded:
-                    results.append((encoded, decoded))
-                    found.add(encoded)
-            # else:
-                # print 'VBA STRING: encoded=%r => decoded=%r' % (encoded, decoded)
+    # pyparsing uses several dozen Python frames per nesting level: make sure
+    # the recursion limit allows parsing up to MAX_VBA_EXPR_DEPTH, and restore
+    # the original limit afterwards. (on Python 3.11+ those frames do not
+    # consume the C stack, so a higher limit is safe)
+    old_recursion_limit = sys.getrecursionlimit()
+    if old_recursion_limit < VBA_EXPR_RECURSION_LIMIT:
+        sys.setrecursionlimit(VBA_EXPR_RECURSION_LIMIT)
+    try:
+        # Split the VBA code line by line to avoid MemoryError on large scripts:
+        for line_no, vba_line in enumerate(vba_code.splitlines(), start=1):
+            # fast pre-filter: a line without any operator, parenthesis, dot
+            # or quote cannot contain a deobfuscatable VBA expression:
+            if VBA_EXPR_TRIGGER_RE.search(vba_line) is None:
+                continue
+            # reject excessively nested (potentially malicious) expressions
+            # with a controlled error, instead of exhausting the call stack:
+            depth = vba_expression_depth(vba_line)
+            if depth > MAX_VBA_EXPR_DEPTH:
+                error = VbaEvaluationError(
+                    'VBA expression nested too deeply (%d levels > limit %d), '
+                    'possible malicious input - line not deobfuscated'
+                    % (depth, MAX_VBA_EXPR_DEPTH),
+                    expr=vba_line.strip()[:100], line=line_no, col=1)
+                log.debug('detect_vba_strings: %s', error)
+                if errors is not None:
+                    errors.append(error)
+                continue
+            try:
+                for tokens, start, end in vba_expr_str.scanString(vba_line):
+                    encoded = vba_line[start:end]
+                    decoded = tokens[0]
+                    if isinstance(decoded, VbaEvaluationError):
+                        # controlled error (unknown function, default property,
+                        # overflow, ...): attach the location and record it
+                        decoded.expr = encoded
+                        decoded.line = line_no
+                        decoded.col = start + 1
+                        log.debug('detect_vba_strings: %s', decoded)
+                        if errors is not None:
+                            errors.append(decoded)
+                        continue
+                    if isinstance(decoded, VbaExpressionString):
+                        # This is a VBA expression, not a simple string
+                        # print 'VBA EXPRESSION: encoded=%r => decoded=%r' % (encoded, decoded)
+                        # avoid duplicates and simple strings:
+                        if encoded not in found and decoded != encoded:
+                            results.append((encoded, decoded))
+                            found.add(encoded)
+                    # else:
+                        # print 'VBA STRING: encoded=%r => decoded=%r' % (encoded, decoded)
+            except RecursionError:
+                # backstop: should not happen thanks to the depth check above,
+                # but never crash on malicious input
+                error = VbaEvaluationError(
+                    'VBA expression too complex to evaluate safely '
+                    '(recursion limit reached) - line not deobfuscated',
+                    expr=vba_line.strip()[:100], line=line_no, col=1)
+                log.debug('detect_vba_strings: %s', error)
+                if errors is not None:
+                    errors.append(error)
+    finally:
+        if sys.getrecursionlimit() != old_recursion_limit:
+            sys.setrecursionlimit(old_recursion_limit)
     return results
 
 
@@ -2531,6 +3052,9 @@ class VBA_Scanner(object):
         self.base64_strings = None
         self.dridex_strings = None
         self.vba_strings = None
+        # controlled errors raised by VBA expression deobfuscation
+        # (list of VbaEvaluationError, empty if deobfuscation was not run)
+        self.vba_expr_errors = []
 
 
     def scan(self, include_decoded_strings=False, deobfuscate=False):
@@ -2570,8 +3094,14 @@ class VBA_Scanner(object):
             self.code_dridex += '\n' + decoded
         # Detect obfuscated strings in VBA expressions
         if deobfuscate:
-            self.vba_strings = detect_vba_strings(self.code)
+            self.vba_expr_errors = []
+            self.vba_strings = detect_vba_strings(self.code,
+                                                  errors=self.vba_expr_errors)
+            if self.vba_expr_errors:
+                log.debug('%d VBA expression(s) could not be deobfuscated '
+                          'safely', len(self.vba_expr_errors))
         else:
+            self.vba_expr_errors = []
             self.vba_strings = []
         for encoded, decoded in self.vba_strings:
             self.code_vba += '\n' + decoded
