@@ -1362,6 +1362,13 @@ def decompress_stream(compressed_container):
         # 2.4.1.1.5
         compressed_chunk_start = compressed_current
         # chunk header = first 16 bits
+        if compressed_chunk_start + 2 > len(compressed_container):
+            # truncated stream: not even a full CompressedChunkHeader remains
+            raise ValueError(
+                'truncated VBA compressed stream at offset 0x{0:X}: '
+                'CompressedChunkHeader requires 2 bytes but only {1} remain'
+                .format(compressed_chunk_start,
+                        len(compressed_container) - compressed_chunk_start))
         compressed_chunk_header = \
             struct.unpack("<H", compressed_container[compressed_chunk_start:compressed_chunk_start + 2])[0]
         # chunk size = 12 first bits of header + 3
@@ -1384,18 +1391,33 @@ def decompress_stream(compressed_container):
         if chunk_flag == 0 and chunk_size != 4098:
             raise ValueError('CompressedChunkSize=%d != 4098 but CompressedChunkFlag == 0' % chunk_size)
 
-        # check if chunk_size goes beyond the compressed data, instead of silently cutting it:
-        #TODO: raise an exception?
+        # A truncated CompressedChunk (declared size goes beyond the container)
+        # must fail loudly instead of being silently decoded into partial data
+        # (MS-OVBA 2.4.1.3.6 step 1: CompressedCurrent MUST stay below CompressedRecordEnd):
         if compressed_chunk_start + chunk_size > len(compressed_container):
-            log.warning('Chunk size is larger than remaining compressed data')
-        compressed_end = min([len(compressed_container), compressed_chunk_start + chunk_size])
+            raise ValueError(
+                'truncated VBA compressed stream: CompressedChunk at offset 0x{0:X} '
+                'declares size {1} but only {2} bytes remain'
+                .format(compressed_chunk_start, chunk_size,
+                        len(compressed_container) - compressed_chunk_start))
+        # offset of the byte after the chunk, its 2-byte header included.
+        # NOTE: chunk_size already counts the 2-byte CompressedChunkHeader, so
+        # compressed_end = CompressedChunkStart + CompressedChunkSize (MS-OVBA
+        # 2.4.1.1.5); subtracting the header size here would stop decoding two
+        # bytes before the real end of the chunk.
+        compressed_end = compressed_chunk_start + chunk_size
         # read after chunk header:
         compressed_current = compressed_chunk_start + 2
 
         if chunk_flag == 0:
             # MS-OVBA 2.4.1.3.3 Decompressing a RawChunk
             # uncompressed chunk: read the next 4096 bytes as-is
-            #TODO: check if there are at least 4096 bytes left
+            if compressed_current + 4096 > len(compressed_container):
+                raise ValueError(
+                    'truncated VBA compressed stream: raw CompressedChunk at offset '
+                    '0x{0:X} needs 4096 data bytes but only {1} remain'
+                    .format(compressed_chunk_start,
+                            len(compressed_container) - compressed_current))
             decompressed_container.extend(compressed_container[compressed_current:compressed_current + 4096])
             compressed_current += 4096
         else:
@@ -1424,16 +1446,58 @@ def decompress_stream(compressed_container):
                         compressed_current += 1
                     else:  # CopyToken
                         # MS-OVBA 2.4.1.3.19.2 Unpack CopyToken
+                        if compressed_current + 2 > compressed_end:
+                            # truncated stream: a CopyToken needs 2 bytes
+                            raise ValueError(
+                                'truncated VBA compressed stream: CopyToken at offset '
+                                '0x{0:X} needs 2 bytes but only {1} remain in the CompressedChunk'
+                                .format(compressed_current, compressed_end - compressed_current))
                         copy_token = \
                             struct.unpack("<H", compressed_container[compressed_current:compressed_current + 2])[0]
                         #TODO: check this
-                        length_mask, offset_mask, bit_count, _ = copytoken_help(
+                        # NOTE: copytoken_help's 4th return value is named
+                        # maximum_length but is really the LengthMask value;
+                        # it is not used because the binding length constraint
+                        # is checked explicitly against the 4096-byte limit:
+                        difference = len(decompressed_container) - decompressed_chunk_start
+                        if difference == 0:
+                            # a CopyToken cannot be the first token of a chunk:
+                            # there is no decoded byte it could reference
+                            raise ValueError(
+                                'out-of-bounds CopyToken at compressed offset 0x{0:X}: '
+                                'no decoded byte available yet in the DecompressedChunk'
+                                .format(compressed_current))
+                        length_mask, offset_mask, bit_count, _maximum_length = copytoken_help(
                             len(decompressed_container), decompressed_chunk_start)
                         length = (copy_token & length_mask) + 3
                         temp1 = copy_token & offset_mask
                         temp2 = 16 - bit_count
                         offset = (temp1 >> temp2) + 1
                         #log.debug('offset=%d length=%d' % (offset, length))
+                        # MS-OVBA 2.4.1.3.19: a CopyToken may only reference bytes that
+                        # were already decoded within THIS DecompressedChunk (the sliding
+                        # window restarts at every chunk). Reject references that point
+                        # before the chunk start (negative index would silently wrap to
+                        # bytes of an earlier chunk) or past the 4096-byte chunk end:
+                        if offset > difference:
+                            raise ValueError(
+                                'out-of-bounds CopyToken at compressed offset 0x{0:X}: '
+                                'offset {1} exceeds the {2} decoded byte(s) available in '
+                                'the current DecompressedChunk (chunk starts at decompressed '
+                                'offset 0x{3:X})'
+                                .format(compressed_current, offset, difference,
+                                        decompressed_chunk_start))
+                        # MS-OVBA 2.4.1.3.19.2: a DecompressedChunk may never
+                        # grow beyond 4096 decompressed bytes. (copytoken_help's
+                        # 4th return value is actually the LengthMask, not
+                        # MaximumLength, so the chunk-size test is the binding
+                        # length constraint here.)
+                        if difference + length > 4096:
+                            raise ValueError(
+                                'out-of-bounds CopyToken at compressed offset 0x{0:X}: '
+                                'length {1} would extend the DecompressedChunk past its '
+                                '4096-byte limit (decoded {2} bytes so far)'
+                                .format(compressed_current, length, difference))
                         copy_source = len(decompressed_container) - offset
                         for index in xrange(copy_source, copy_source + length):
                             decompressed_container.extend([decompressed_container[index]])
